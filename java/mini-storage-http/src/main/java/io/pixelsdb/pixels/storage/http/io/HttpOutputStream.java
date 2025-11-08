@@ -30,13 +30,21 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
-import java.util.concurrent.*;
+// [新增导入]: 引入List、Future和并发安全的List实现
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.Future; // 确保导入 java.util.concurrent.Future
 
 public class HttpOutputStream extends OutputStream
 {
     private static final Logger logger = LogManager.getLogger(HttpOutputStream.class);
 
-    /**
+        /**
      * indicates whether the http is still open / valid
      */
     private boolean open;
@@ -86,21 +94,17 @@ public class HttpOutputStream extends OutputStream
      * The capacity of buffer.
      */
     private int bufferCapacity;
-
-    /**
-     * The background thread to send requests.
-     */
+    
     private final ExecutorService executorService;
-
-    /**
-     * The http client.
-     */
     private final AsyncHttpClient httpClient;
-
-    /**
-     * The queue to put pending requests.
-     */
     private final BlockingQueue<byte[]> contentQueue;
+
+    // ========================================================================
+    // [修改]: 添加一个线程安全的列表来跟踪所有“正在发送”的请求
+    // 我们使用CopyOnWriteArrayList，因为它对于“读多写少”的场景非常高效
+    // （这里主要是添加和（在监听器中）移除）
+    private final List<Future<Response>> outstandingSends = new CopyOnWriteArrayList<>();
+    // ========================================================================
 
     public HttpOutputStream(String host, int port, int bufferCapacity) {
         this.open = true;
@@ -110,11 +114,17 @@ public class HttpOutputStream extends OutputStream
         this.bufferCapacity = bufferCapacity;
         this.buffer = new byte[bufferCapacity];
         this.bufferPosition = 0;
-        this.httpClient = Dsl.asyncHttpClient();
+
+        // [修改 1]: 配置AsyncHttpClient以启用异步重试 (这部分是正确的)
+        this.httpClient = Dsl.asyncHttpClient(Dsl.config()
+                .setMaxRequestRetry(MAX_RETRIES) // 使用类中定义的常量
+                .build());
+
         this.executorService = Executors.newSingleThreadExecutor();
         this.contentQueue = new LinkedBlockingQueue<>();
 
-        // Start background thread to send requests.
+        // [修改 2]: 
+        // 后台线程的逻辑保持不变，它仍然是消费队列并调用 sendContentAsync
         this.executorService.submit(() -> {
             while (true)
             {
@@ -123,10 +133,13 @@ public class HttpOutputStream extends OutputStream
                     byte[] content = contentQueue.take();
                     if (content.length == 0)
                     {
-                        closeStreamReader();
+                        // 当收到 "0-byte" 信号...
+                        // 1. 等待所有已提交的请求完成
+                        // 2. 发送 "close" 信号
+                        waitAndCloseStreamReader(); 
                         break;
                     }
-                    sendContentWithRetry(content);
+                    sendContentAsync(content);
                 } catch (InterruptedException e)
                 {
                     logger.error("Background thread interrupted", e);
@@ -213,7 +226,7 @@ public class HttpOutputStream extends OutputStream
             {
                 flush();
             }
-            this.contentQueue.add(new byte[0]);
+            this.contentQueue.add(new byte[0]); 
             this.executorService.shutdown();
             try
             {
@@ -228,76 +241,84 @@ public class HttpOutputStream extends OutputStream
         }
     }
 
-    private void sendContentWithRetry(byte[] content)
+    // ========================================================================
+    // [修改]: 修改 sendContentAsync 来跟踪 Future
+    // [修改 3]
+    private void sendContentAsync(byte[] content)
     {
-        int retry = 0;
-        while (retry <= MAX_RETRIES)
+        try
         {
-            try
-            {
-                Request req = httpClient.preparePost(this.uri)
-                        .setBody(ByteBuffer.wrap(content))
-                        .addHeader(HttpHeaderNames.CONTENT_TYPE, "application/x-protobuf")
-                        .addHeader(HttpHeaderNames.CONTENT_LENGTH, String.valueOf(content.length))
-                        .addHeader(HttpHeaderNames.CONNECTION, "keep-alive")
-                        .build();
-                httpClient.executeRequest(req).get();
-                break;
-            } catch (Exception e)
-            {
-                retry++;
-                if (retry > MAX_RETRIES ||
-                        !(e.getCause() instanceof java.net.ConnectException || e.getCause() instanceof java.io.IOException))
-                {
-                    logger.error("Failed to send content after {} retries, exception: {}", retry, e.getMessage());
-                    break;
-                }
-                try
-                {
-                    Thread.sleep(RETRY_DELAY_MS);
-                } catch (InterruptedException e1)
-                {
-                    logger.error("Retry interrupted", e1);
-                    break;
-                }
-            }
+            Request req = httpClient.preparePost(this.uri)
+                    .setBody(ByteBuffer.wrap(content))
+                    .addHeader(HttpHeaderNames.CONTENT_TYPE, "application/x-protobuf")
+                    .addHeader(HttpHeaderNames.CONTENT_LENGTH, String.valueOf(content.length))
+                    .addHeader(HttpHeaderNames.CONNECTION, "keep-alive")
+                    .build();
+            
+            // 异步执行，不调用.get()
+            ListenableFuture<Response> future = httpClient.executeRequest(req);
+            
+            // [新逻辑]: 将返回的 Future 添加到跟踪列表
+            outstandingSends.add(future);
+            
+            // [新逻辑]: 添加一个监听器，当请求完成时（无论成功或失败），
+            // 将其从列表中移除，避免内存泄漏。
+            future.addListener(() -> outstandingSends.remove(future), null);
+
+        } catch (Exception e)
+        {
+            // 这个catch现在只会捕捉到构建请求(preparePost)时发生的异常
+            logger.error("Failed to prepare/send content", e);
         }
     }
+    // ========================================================================
+
 
     /**
-     * Tell http reader that this http closes.
+     * [修改]: 将 closeStreamReader 拆分为 "wait" 和 "close" 两步
+     * 这个方法现在由后台线程在收到 "0-byte" 信号后调用。
      */
-    private void closeStreamReader()
+    private void waitAndCloseStreamReader()
     {
+        // ========================================================================
+        // [修改4 - 屏障]: 
+        // 在发送关闭信号之前，等待所有已提交的异步请求完成。
+        // 这创建了一个"屏障"(Barrier)，确保所有数据块在"Connection: close"之前被发送。
+        try
+        {
+            // 拷贝一份列表快照，防止在迭代时列表被修改
+            List<Future<Response>> futuresToWait = List.copyOf(outstandingSends);
+            logger.debug("Waiting for {} outstanding sends to complete...", futuresToWait.size());
+            
+            for (Future<Response> f : futuresToWait) 
+            {
+                if (!f.isDone()) {
+                   // .get() 会阻塞，直到这个特定的请求完成（或重试失败）
+                   f.get();
+                }
+            }
+            logger.debug("All outstanding sends completed.");
+        } catch (Exception e) 
+        {
+            logger.error("Error waiting for outstanding sends to complete, proceeding with close anyway", e);
+            // 即使有错误，我们仍然尝试关闭
+        }
+        // ========================================================================
+
+        // [修改 5]: 发送真正的 "close" 信号
+        // 屏障已经确保了所有数据都已发送，现在可以安全地关闭了。
         Request req = httpClient.preparePost(this.uri)
                 .addHeader(HttpHeaderNames.CONTENT_TYPE, "application/x-protobuf")
                 .addHeader(HttpHeaderNames.CONTENT_LENGTH, "0")
                 .addHeader(HttpHeaderNames.CONNECTION, HttpHeaderValues.CLOSE)
                 .build();
-        int retry = 0;
-        while (retry <= MAX_RETRIES)
+        try
         {
-            try
-            {
-                httpClient.executeRequest(req).get();
-                break;
-            } catch (Exception e)
-            {
-                retry++;
-                if (retry > MAX_RETRIES || !(e.getCause() instanceof java.net.ConnectException))
-                {
-                    logger.error("Failed to close http reader after {} retries, exception: {}", retry, e.getMessage());
-                    break;
-                }
-                try
-                {
-                    Thread.sleep(RETRY_DELAY_MS);
-                } catch (InterruptedException e1)
-                {
-                    logger.error("Retry interrupted", e1);
-                    break;
-                }
-            }
+            // 在这里 .get() 是正确的，因为要确保 "close" 信号被同步发送
+            httpClient.executeRequest(req).get(); 
+        } catch (Exception e)
+        {
+            logger.error("Failed to close http reader after {} retries, exception: {}", MAX_RETRIES, e.getMessage());
         }
     }
 
